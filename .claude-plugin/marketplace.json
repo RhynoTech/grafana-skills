@@ -1,0 +1,16 @@
+{
+  "name": "grafana-skills",
+  "metadata": {
+    "description": "Skills and shell tooling for investigating incidents through Grafana: PromQL/LogQL queries, canned incident presets, and config-driven reports."
+  },
+  "owner": {
+    "name": "Ryan Scott"
+  },
+  "plugins": [
+    {
+      "name": "grafana-tools",
+      "source": "./",
+      "description": "Grafana PromQL/LogQL query helpers, incident-investigation presets, and a config-driven report generator, with skills for authoring new presets and reports."
+    }
+  ]
+}

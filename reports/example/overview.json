@@ -1,0 +1,39 @@
+{
+  "title": "Service Overview Report",
+  "_comment": "Generic example report definition. Copy to reports/local/<name>.json (gitignored) and swap in your real metric names. Sections render in order. Query tokens replaced at run time: __W__ = window length in hours (24 for daily columns, days*24 for the window total), __TS__ = epoch seconds for the PromQL @-modifier. PromQL braces are left untouched. Section kinds: 'scalar' (per-day + window total), 'range_max' (per-day peak of a range query), 'topn' (top rows of a by() query, optional \"csv\": true).",
+  "sections": [
+    {
+      "kind": "scalar",
+      "title": "Request Volume",
+      "metrics": [
+        { "label": "Requests", "query": "sum(increase(http_requests_total[__W__h] @ __TS__))" },
+        { "label": "5xx errors", "query": "sum(increase(http_requests_total{status=~\"5..\"}[__W__h] @ __TS__))" },
+        { "label": "Error rate", "fmt": "pct", "query": "100 * sum(rate(http_requests_total{status=~\"5..\"}[__W__h] @ __TS__)) / clamp_min(sum(rate(http_requests_total[__W__h] @ __TS__)), 1)" }
+      ]
+    },
+    {
+      "kind": "range_max",
+      "title": "Resource Peaks",
+      "metrics": [
+        { "label": "CPU cores", "fmt": "float", "query": "sum(rate(container_cpu_usage_seconds_total{container!=\"\"}[5m]))" },
+        { "label": "Memory GiB", "fmt": "float", "query": "sum(container_memory_working_set_bytes{container!=\"\"}) / 1024^3" },
+        { "label": "HTTP p95", "fmt": "seconds", "query": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))" }
+      ]
+    },
+    {
+      "kind": "topn",
+      "title": "Top Error Services",
+      "item_label": "Service",
+      "top": 5,
+      "query": "sum by (service) (increase(http_requests_total{status=~\"5..\"}[__W__h] @ __TS__))"
+    },
+    {
+      "kind": "topn",
+      "title": "Kafka Topic Volume",
+      "item_label": "Topic",
+      "top": 15,
+      "csv": true,
+      "query": "sum by (topic) (increase(kafka_topic_partition_current_offset{topic!~\"__.*\"}[__W__h] @ __TS__))"
+    }
+  ]
+}
