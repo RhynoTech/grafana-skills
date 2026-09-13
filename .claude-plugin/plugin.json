@@ -1,7 +1,7 @@
 {
   "name": "grafana-tools",
-  "description": "Query Grafana's Prometheus (PromQL) and Loki (LogQL) datasources from the CLI, run canned incident-investigation presets, and generate config-driven reports — plus skills for authoring new presets and reports.",
-  "version": "1.0.0",
+  "description": "Query Grafana's Prometheus (PromQL) and Loki (LogQL) datasources from the CLI, run canned incident-investigation presets, and generate config-driven reports \u2014 plus skills for authoring new presets and reports.",
+  "version": "1.1.0",
   "license": "MIT",
   "homepage": "https://github.com/RhynoTech/grafana-skills",
   "repository": "https://github.com/RhynoTech/grafana-skills",
