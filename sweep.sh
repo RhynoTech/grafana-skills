@@ -248,7 +248,7 @@ def sweep_logql():
             ledger.append({"start": lo, "end": hi, "status": "failed", "error": err.strip()})
             continue
 
-        payload = json.loads(out)
+        payload = json.loads(out, strict=False)
         chunk_rows = entries_of(payload)
         lines_scanned, cached = scanned(payload)
         span = hi - lo
@@ -317,7 +317,7 @@ def sweep_logql_agg():
             ledger.append({"start": lo, "end": hi, "status": "failed", "error": err.strip()})
             continue
 
-        payload = json.loads(out)
+        payload = json.loads(out, strict=False)
         total = 0
         for frame in payload.get("data", {}).get("result", []):
             vals = frame.get("values") or ([frame["value"]] if "value" in frame else [])
@@ -368,7 +368,7 @@ def sweep_promql():
             ledger.append({"start": lo, "end": hi, "status": "failed", "error": err.strip()})
             continue
 
-        payload = json.loads(out)
+        payload = json.loads(out, strict=False)
         points = 0
         for frame in payload.get("data", {}).get("result", []):
             key = json.dumps(frame.get("metric", {}), sort_keys=True)
