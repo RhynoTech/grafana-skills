@@ -13,12 +13,18 @@ const promqlScript = join(scriptDir, 'promql.sh')
 const logqlScript = join(scriptDir, 'logql.sh')
 const incidentScript = join(scriptDir, 'incident.sh')
 const reportScript = join(scriptDir, 'report.sh')
+const sweepScript = join(scriptDir, 'sweep.sh')
 
 // A curl stand-in that records its args and returns an empty success payload.
+// It emulates the -w '\\n%{http_code}' trailer the scripts rely on to tell a
+// datasource error (400 body, 502 cost ceiling) from an auth redirect.
 const MOCK_CURL = `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$@" > "${'${ARGS_FILE}'}"
 printf '{"status":"success","data":{"result":[]}}\\n'
+printf '%s' "\${MOCK_HTTP_CODE:-200}"
+[[ "\${MOCK_HTTP_CODE:-200}" -ge 400 ]] && exit 22
+exit 0
 `
 
 async function withMockCurl() {
@@ -135,6 +141,115 @@ test('a clear error is raised when no credentials are configured', async () => {
             return true
         }
     )
+})
+
+test('a cost-ceiling 502 is reported as a ceiling, not an empty result', async () => {
+    const { mockCurl } = await withMockCurl()
+    await assert.rejects(
+        execFileAsync(promqlScript, ['up'], {
+            env: baseEnv({
+                CURL_BIN: mockCurl,
+                MOCK_HTTP_CODE: '502',
+                GRAFANA_BASE_URL: 'https://grafana.example.com',
+                GRAFANA_TOKEN: 'tok_123',
+            }),
+        }),
+        error => {
+            assert.match(error.stderr, /too expensive to finish/)
+            assert.match(error.stderr, /Narrow the window|sweep\.sh/)
+            assert.equal(error.stdout, '')
+            return true
+        }
+    )
+})
+
+test('an auth redirect is reported as expired credentials, not a query problem', async () => {
+    const { mockCurl } = await withMockCurl()
+    await assert.rejects(
+        execFileAsync(logqlScript, ['{app="api"}'], {
+            env: baseEnv({
+                CURL_BIN: mockCurl,
+                MOCK_HTTP_CODE: '302',
+                GRAFANA_BASE_URL: 'https://grafana.example.com',
+                GRAFANA_COOKIE: '_oauth2_proxy=abc',
+            }),
+        }),
+        error => {
+            assert.match(error.stderr, /auth failed/)
+            assert.match(error.stderr, /cookie has almost certainly expired/)
+            assert.equal(error.stdout, '')
+            return true
+        }
+    )
+})
+
+test("a datasource 400 surfaces the datasource's own error body", async () => {
+    const { mockCurl } = await withMockCurl()
+    await assert.rejects(
+        execFileAsync(promqlScript, ['--start', '1', '--end', '2', '--step', '30s', 'up'], {
+            env: baseEnv({
+                CURL_BIN: mockCurl,
+                MOCK_HTTP_CODE: '400',
+                GRAFANA_BASE_URL: 'https://grafana.example.com',
+                GRAFANA_TOKEN: 'tok_123',
+            }),
+        }),
+        error => {
+            assert.match(error.stderr, /HTTP 400/)
+            assert.match(error.stderr, /"status":"success"/)
+            assert.equal(error.stdout, '')
+            return true
+        }
+    )
+})
+
+test('sweep tiles a range into non-overlapping chunks', async () => {
+    const { mockCurl } = await withMockCurl()
+    const { stderr } = await execFileAsync(
+        sweepScript,
+        ['--type', 'promql', '--start', '1700000000', '--end', '1700014400', '--chunk', '1h', 'up'],
+        {
+            env: baseEnv({
+                CURL_BIN: mockCurl,
+                GRAFANA_BASE_URL: 'https://grafana.example.com',
+                GRAFANA_TOKEN: 'tok_123',
+            }),
+        }
+    )
+    // 14400 seconds at a 1h chunk is exactly 4 windows.
+    assert.match(stderr, /chunks: 4/)
+})
+
+test('sweep splits a chunk that comes back at the line limit', async () => {
+    const { tempDir, argsFile } = await withMockCurl()
+    // A curl that returns exactly --limit lines, so every window looks capped
+    // and sweep must keep halving until it reaches --min-chunk.
+    const cappingCurl = join(tempDir, 'capping-curl.sh')
+    await writeFile(
+        cappingCurl,
+        `#!/bin/bash
+printf '%s\n' "$@" >> "${argsFile}"
+printf '{"status":"success","data":{"resultType":"streams","result":[{"stream":{},"values":[["1700000000000000000","a"],["1700000000000000001","b"]]}]}}\n'
+printf '200'
+`
+    )
+    await chmod(cappingCurl, 0o755)
+    const result = await execFileAsync(
+        sweepScript,
+        ['--type', 'logql', '--start', '1700000000', '--end', '1700000600',
+         '--chunk', '10m', '--min-chunk', '5m', '--limit', '2', '--mode', 'count', '{app="api"}'],
+        {
+            env: baseEnv({
+                CURL_BIN: cappingCurl,
+                GRAFANA_BASE_URL: 'https://grafana.example.com',
+                GRAFANA_TOKEN: 'tok_123',
+            }),
+        }
+    ).catch(error => error)
+    // Still capped at --min-chunk, so the sweep must refuse to call it a total.
+    assert.match(result.stderr, /capped at 2 -> splitting/)
+    assert.match(result.stderr, /INCOMPLETE: this sweep is a floor/)
+    assert.equal(result.code, 2)
 })
 
 test('incident list shows the example presets', async () => {

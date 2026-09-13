@@ -53,7 +53,7 @@ scripts described below.
      browser session in `GRAFANA_<ENV>_COOKIE` (a single line like
      `_oauth2_proxy=…; …`).
 4. Optional: add the repo directory to your `PATH` so you can run `promql.sh` /
-   `logql.sh` / `incident.sh` without the full path.
+   `logql.sh` / `sweep.sh` / `incident.sh` without the full path.
 
 ## Team setup (private presets, reports, and config)
 
@@ -133,6 +133,30 @@ Explicit window (`--start`/`--end` are **nanoseconds**; `--since` is seconds):
   --limit 50 \
   '{app="api-server"} |= "timeout"'
 ```
+
+## Long ranges (`sweep.sh`)
+
+Both datasources refuse large queries, and none of the refusals look like one:
+Loki answers an over-large window with an HTTP `502` and an over-large *result*
+by truncating to `--limit` (returning the **newest** lines); Prometheus rejects
+more than 11,000 points per series with a `400`; and both silently return less
+than you asked for once you reach past retention.
+
+`sweep.sh` walks the range in non-overlapping chunks instead: it halves a chunk
+that `502`s, splits a chunk that comes back capped, sizes PromQL chunks against
+the point limit, flags chunks served from Loki's results cache, and exits `2`
+when the sweep is incomplete so a partial total is never mistaken for a count.
+
+```bash
+./sweep.sh --since 7d '{app="api"} |= "ECONNRESET"' > lines.jsonl
+./sweep.sh --since 30d --chunk 1d --mode count '{app="api"} |= "error"'
+./sweep.sh --type promql --since 30d --step 1h 'sum(rate(http_requests_total[5m]))'
+./sweep.sh --since 7d --summary-json ledger.json '{app="api"} |= "timeout"'
+```
+
+The ceiling is **lines scanned, not hours** — a tight selector may sweep a day at
+a time where a namespace-wide one struggles past 15 minutes. `--summary-json`
+writes the per-chunk ledger that backs any number you publish.
 
 ## Incident presets
 

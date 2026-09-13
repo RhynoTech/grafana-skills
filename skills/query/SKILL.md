@@ -11,7 +11,10 @@ description: >-
   high-error-rate alert firing", "consumer lag on the orders topic", "is the
   delivery queue backed up", "tail the api-server errors"), and whenever they
   mention Grafana, Prometheus, PromQL, Loki, LogQL, or pulling metrics/logs.
-  Prefer these helpers over hand-rolled curl against Grafana.
+  Also use it whenever a question spans a long range (days or weeks of logs or
+  metrics, a backfill, a trend, "how often has this happened this month"), since
+  both datasources silently truncate or reject wide windows and the range has to
+  be swept in chunks. Prefer these helpers over hand-rolled curl against Grafana.
 ---
 
 # Grafana Query
@@ -30,14 +33,21 @@ definitions, see the **author-report** skill.
 You're investigating something in production and need real numbers or log
 lines. The fastest path is almost always:
 
-1. **Is there a preset?** Run `incident.sh list` and check. Presets encode
-   queries that already proved useful in past incidents — start there before
-   authoring a query from scratch.
+1. **Is it already written down?** Run `incident.sh list` — presets encode
+   queries that already proved useful in past incidents. Then read `LEARNED.md`
+   in your config directory (`~/.config/grafana-tools/LEARNED.md`) if it exists:
+   it holds the label names, metric names, and traps this system has already cost
+   someone an afternoon. Both beat authoring from scratch.
 2. **Metric question → `promql.sh`. Log question → `logql.sh`.** Rates, counts,
    percentiles, queue depths, lag → Prometheus. Error text, stack traces,
    "what is this service actually logging" → Loki.
 3. **Narrow once you see signal.** Start broad (a preset or a `sum by (...)`),
    then add label filters and tighten the time window to isolate the problem.
+4. **Sweep, don't widen.** Anything past a few hours of logs goes through
+   `sweep.sh`. Widening a window until it fails is how you get a `502` that reads
+   as an outage, or a truncated result that reads as a complete one.
+5. **Write down what surprised you.** See *Record what you learn* below — a trap
+   you hit today is one the next run should not have to rediscover.
 
 ## Invoking the scripts
 
@@ -48,6 +58,7 @@ the plugin is installed:
 ```bash
 "$CLAUDE_PLUGIN_ROOT"/promql.sh '<query>'
 "$CLAUDE_PLUGIN_ROOT"/logql.sh '<selector>'
+"$CLAUDE_PLUGIN_ROOT"/sweep.sh --since 7d '<selector>'
 "$CLAUDE_PLUGIN_ROOT"/incident.sh list
 "$CLAUDE_PLUGIN_ROOT"/report.sh --help
 ```
@@ -136,6 +147,41 @@ Tighten the window and add filters:
 `--start`/`--end` in **nanoseconds** (note: PromQL uses seconds, Loki uses
 nanoseconds — easy to mix up). `|=` is substring match, `|~` is regex.
 
+## Long ranges: sweep, never widen (`sweep.sh`)
+
+Both datasources refuse large queries, and **not one of those refusals looks like
+a refusal**:
+
+- Loki answers an over-large window with an HTTP `502` from the gateway — which
+  reads as an outage, not a cost ceiling.
+- Loki answers an over-large *result* by truncating to `--limit` and returning
+  the **newest** lines, so the oldest timestamp you see is not the start of
+  anything.
+- Prometheus refuses more than 11,000 points per series with an HTTP `400`.
+- Both stores silently return less than you asked for once you reach past
+  retention. No error, no gap marker.
+
+So do not widen a window until it breaks. Sweep the range in chunks:
+
+```bash
+"$CLAUDE_PLUGIN_ROOT"/sweep.sh --since 7d '{app="api"} |= "ECONNRESET"'
+"$CLAUDE_PLUGIN_ROOT"/sweep.sh --since 30d --chunk 1d --mode count '{app="api"} |= "error"'
+"$CLAUDE_PLUGIN_ROOT"/sweep.sh --type promql --since 30d --step 1h 'sum(rate(http_requests_total[5m]))'
+```
+
+`sweep.sh` tiles the range into non-overlapping chunks, halves any chunk that
+`502`s, splits any chunk that comes back capped, sizes PromQL chunks against the
+point limit, and flags chunks served from Loki's results cache. **It exits 2 when
+the sweep is incomplete** — the total it printed is then a floor, not a count.
+
+The ceiling is **lines scanned, not hours**: a tight selector may sweep a day at
+a time while a namespace-wide one struggles past 15 minutes. Read
+`data.stats.summary.totalLinesProcessed` from a first chunk to size the rest.
+
+[references/windows-and-limits.md](references/windows-and-limits.md) has the
+measurements, the chunk-size table, and the cache trap in full. Read it before
+quoting any count, duration, or zero.
+
 ## Incident presets (`incident.sh`)
 
 Canned queries for recurring investigations, grouped one file per concern.
@@ -180,8 +226,57 @@ Writes `<prefix>.md`, `<prefix>.json`, and a CSV per section flagged `csv` to
 `report.sh --help` for all options. To create a new report definition, use the
 **author-report** skill.
 
+## Record what you learn
+
+This skill is meant to get better every time it is used. Two things are worth
+writing down the moment you find them, because the next run cannot rediscover
+them for free.
+
+### 1. A trap, a limit, or a correction
+
+Whenever a query **lied** — an empty result from a wrong label, a window that
+`502`d, a count inflated by overlapping windows, a metric whose exported name was
+not what the naming convention implied, a cache-served zero — write it down
+before moving on. The test is simple: *would the next person have believed the
+wrong answer?* If yes, it is worth a note.
+
+Route it by what kind of fact it is:
+
+- **A fact about the tools or the query engines** — a limit, a response shape, a
+  flag, a way one of these stores misleads you. Generic: it would be true at any
+  company. Add it to
+  [references/windows-and-limits.md](references/windows-and-limits.md) or the
+  relevant section of this skill, and note the measurement that proves it.
+- **A fact about your systems** — a label value, an exported metric name, a
+  service that is really three services, a threshold, a consumer group, a
+  retention figure. Site-specific: it must **not** land in this repo. Write it to
+  `LEARNED.md` in your private config directory
+  (`~/.config/grafana-tools/LEARNED.md`), which the team shares and plugin
+  updates never touch.
+
+Keep each entry to a few lines: what you expected, what actually happened, the
+measurement, and the rule to apply next time. Date it. A wrong entry is worse
+than no entry, so record what you **measured**, not what you inferred — and when
+a later run contradicts an entry, correct it rather than appending a second
+version.
+
+### 2. A query you have now run twice
+
+A query you needed twice is a query you will need again, and re-deriving it costs
+the same every time. Promote it to a **preset** (see the **author-preset** skill)
+so it is one `incident.sh run` away, and to a **report section** (see the
+**author-report** skill) if it belongs in a recurring health picture.
+
+The bar is low on purpose. A preset that turns out to be wrong is cheap to fix; a
+query rebuilt from scratch on every incident is not. Run `incident.sh list` at
+the start of an investigation — the answer may already be written down.
+
 ## Reference
 
 - [references/queries.md](references/queries.md) — datasource details, the
   environment/auth variables, the preset and report-definition formats,
   PromQL/LogQL authoring tips, and `jq` recipes for reading the JSON output.
+- [references/windows-and-limits.md](references/windows-and-limits.md) — the four
+  ceilings (gateway timeout, line limit, point limit, retention), how each one
+  fakes a plausible answer, the results-cache trap, chunk sizing, and what has to
+  be true before you write down a zero.

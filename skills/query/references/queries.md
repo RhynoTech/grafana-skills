@@ -32,6 +32,9 @@ uppercased with non-alphanumerics turned into `_` (so `us-east` → `US_EAST`).
 | `GRAFANA_QUERY_REPORTS_DIR` | Directory of report `*.json` definitions | `reports/local` → `~/.config/grafana-tools/reports` → `reports/example` |
 | `CURL_BIN` | Override the curl executable (used by the test suite) | `curl` |
 
+`sweep.sh` takes no configuration of its own — it shells out to `promql.sh` and
+`logql.sh`, so it inherits the active environment and credentials.
+
 Auth precedence per environment: a **token** (`Authorization: Bearer`) is used if
 present, otherwise the **cookie** header; if neither is set the scripts exit with
 a clear message. A prefixed `GRAFANA_<ENV>_*` value wins over the unprefixed one.
@@ -43,6 +46,9 @@ This trips people up constantly:
 - **PromQL** (`promql.sh`): `--start`/`--end` are **Unix epoch seconds**.
 - **LogQL** (`logql.sh`): `--start`/`--end` are **nanoseconds**;
   `--since` is a relative lookback in **seconds**.
+- **`sweep.sh`**: `--start`/`--end` are **seconds for both datasources** — it
+  converts for Loki itself. `--since` takes a duration (`6h`, `7d`), not a
+  bare number of seconds.
 
 Prefer `--since` for Loki unless you need an exact historical window. For
 PromQL ranges, generate bounds with `date`:
@@ -50,6 +56,25 @@ PromQL ranges, generate bounds with `date`:
 ```bash
 end=$(date +%s); start=$((end - 3600))   # last hour
 ```
+
+For anything longer than a few hours, use `sweep.sh` rather than a single wide
+window — see [windows-and-limits.md](windows-and-limits.md).
+
+## How the scripts report failure
+
+`run_grafana_query` in `common.sh` uses curl's `--fail-with-body`, so the
+datasource's own error text survives instead of being replaced by a bare exit
+code. Failures are classified before they reach you:
+
+| HTTP | What you get on stderr | What it means |
+| --- | --- | --- |
+| `200` | (JSON on stdout) | Success. |
+| `3xx`, `401`, `403` | "auth failed … cookie has almost certainly expired" | A setup step. No query change helps. |
+| `502`, `503`, `504` | "too expensive to finish … narrow the window" | A cost ceiling, **not** an absence of data. |
+| other | the datasource's own error body | e.g. "exceeded maximum resolution of 11,000 points". |
+
+stdout stays clean on failure, so a `jq` pipeline sees empty input rather than an
+error document — and the script exits non-zero in every non-`200` case.
 
 ## Preset files (`presets/`)
 

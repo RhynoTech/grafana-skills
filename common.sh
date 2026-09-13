@@ -142,16 +142,53 @@ run_grafana_query() {
   token="$(grafana_token)"
   cookie="$(grafana_cookie)"
 
+  local -a auth=()
   if [[ -n "$token" ]]; then
-    "$curl_bin" -fsS -G -H "Authorization: Bearer $token" "$@" "$base_url/$datasource_path"
+    auth=(-H "Authorization: Bearer $token")
   elif [[ -n "$cookie" ]]; then
-    "$curl_bin" -fsS -G -H "Cookie: $cookie" "$@" "$base_url/$datasource_path"
+    auth=(-H "Cookie: $cookie")
   else
     printf 'No Grafana credentials configured for env "%s".\n' "$(grafana_env)" >&2
     printf 'Set GRAFANA_%s_TOKEN or GRAFANA_%s_COOKIE (or the unprefixed GRAFANA_TOKEN / GRAFANA_COOKIE) in your .env. See .env.example.\n' \
       "$(_grafana_env_prefix)" "$(_grafana_env_prefix)" >&2
     exit 1
   fi
+
+  # --fail-with-body, not -f: the datasource's own error body is the useful part
+  # ("exceeded maximum resolution of 11,000 points", "query too large"), and -f
+  # discards it, leaving only curl's exit code.
+  local raw rc=0 http_code body
+  raw="$("$curl_bin" --fail-with-body -sS -G -w '\n%{http_code}' "${auth[@]}" "$@" "$base_url/$datasource_path")" || rc=$?
+  http_code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+
+  case "$http_code" in
+    200)
+      printf '%s\n' "$body"
+      return 0
+      ;;
+    301 | 302 | 303 | 307 | 308 | 401 | 403)
+      # oauth2-proxy answers an expired session with a redirect to a login page.
+      # The body is HTML, so a caller piping to a JSON parser sees a parse error
+      # rather than an auth problem.
+      printf 'Grafana auth failed for env "%s" (HTTP %s).\n' "$(grafana_env)" "$http_code" >&2
+      printf 'A session cookie has almost certainly expired. Refresh GRAFANA_%s_COOKIE from a logged-in browser, or set GRAFANA_%s_TOKEN.\n' \
+        "$(_grafana_env_prefix)" "$(_grafana_env_prefix)" >&2
+      printf 'This is a setup step: no change to the query can work around it.\n' >&2
+      return 1
+      ;;
+    502 | 503 | 504)
+      printf 'Grafana returned HTTP %s — the query was too expensive to finish.\n' "$http_code" >&2
+      printf 'This is a cost ceiling, not an absence of data. Narrow the window (halve it), tighten the selector, or sweep the range in chunks with sweep.sh.\n' >&2
+      return 1
+      ;;
+    *)
+      printf 'Grafana request failed (HTTP %s).\n' "$http_code" >&2
+      [[ -n "$body" ]] && printf '%s\n' "$body" >&2
+      [[ "$rc" -eq 0 ]] && rc=1
+      return "$rc"
+      ;;
+  esac
 }
 
 current_time_ns() {
