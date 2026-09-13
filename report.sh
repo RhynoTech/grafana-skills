@@ -134,6 +134,8 @@ promql_script = SCRIPT_DIR / "promql.sh"
 if not promql_script.exists():
     raise SystemExit(f"Missing helper: {promql_script}")
 
+sweep_script = SCRIPT_DIR / "sweep.sh"
+
 day_windows = []
 for i in range(days):
     ds = window_start + timedelta(days=i)
@@ -203,6 +205,35 @@ def range_max(query, start, end_exclusive, step="300s"):
             if max_v is None or v > max_v:
                 max_v = v
     return 0.0 if max_v is None else max_v
+
+
+def log_count(selector, start_ts, end_ts, chunk="6h", limit=5000):
+    """Count matching log lines over a window.
+
+    Goes through sweep.sh in "agg" mode: counting server-side with
+    count_over_time returns a number rather than lines, so it is far cheaper
+    than pulling them and the --limit truncation cannot apply. sweep halves any
+    chunk the gateway refuses, so a wide window degrades into more queries
+    rather than into a 502 that reads as zero. Returns (count, complete).
+    """
+    if not sweep_script.exists():
+        raise SystemExit(f"Missing helper: {sweep_script} (log sections need it)")
+    proc = subprocess.run(
+        [str(sweep_script), "--type", "logql", "--start", str(start_ts),
+         "--end", str(end_ts), "--chunk", chunk, "--limit", str(limit),
+         "--mode", "agg", selector],
+        cwd=SCRIPT_DIR, text=True, capture_output=True,
+    )
+    # 2 means some chunk failed or stayed capped: the total is a floor, which the
+    # report has to disclose rather than print as a count.
+    if proc.returncode not in (0, 2):
+        raise RuntimeError(proc.stderr.strip() or "sweep.sh failed")
+    total = 0
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            total += json.loads(line)["count"]
+    return total, proc.returncode == 0
 
 
 def fmt_int(v):
@@ -291,8 +322,42 @@ for sec in sections:
                     writer.writerow([label_key(metric), f"{value:.6f}"])
             csv_paths.append(csv_path)
 
+    elif kind == "log_scalar":
+        chunk = sec.get("chunk", "6h")
+        limit = int(sec.get("limit", 5000))
+        computed = []
+        any_incomplete = False
+        for m in sec.get("metrics", []):
+            day_vals, day_complete = [], []
+            for d in day_windows:
+                v, ok = log_count(m["selector"], d["start_ts"], d["end_ts"], chunk, limit)
+                day_vals.append(float(v))
+                day_complete.append(ok)
+                any_incomplete = any_incomplete or not ok
+            computed.append({
+                "label": m["label"], "fmt": m.get("fmt", "int"),
+                "days": day_vals, "complete": day_complete,
+                "total": float(sum(day_vals)),
+                "total_complete": all(day_complete),
+            })
+        lines.append("| Log lines | " + " | ".join(labels) + " | Window Total |")
+        lines.append("|---|" + "|".join(["---:"] * (len(labels) + 1)) + "|")
+        for r in computed:
+            cells = [
+                fmt_value(v, r["fmt"]) + ("" if ok else " †")
+                for v, ok in zip(r["days"], r["complete"])
+            ]
+            cells.append(fmt_value(r["total"], r["fmt"]) + ("" if r["total_complete"] else " †"))
+            lines.append(f"| {r['label']} | " + " | ".join(cells) + " |")
+        if any_incomplete:
+            lines.append("")
+            lines.append("_† incomplete sweep — a chunk failed or stayed capped, so that figure is a floor, not a count._")
+        artifact_sections.append({"kind": kind, "title": title, "metrics": computed})
+
     else:
-        raise SystemExit(f"Unknown section kind: {kind!r} (expected scalar, range_max, or topn)")
+        raise SystemExit(
+            f"Unknown section kind: {kind!r} (expected scalar, range_max, topn, or log_scalar)"
+        )
 
     lines.append("")
 

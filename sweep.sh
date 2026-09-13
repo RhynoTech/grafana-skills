@@ -44,9 +44,13 @@ Options:
   --min-chunk <duration>  Smallest chunk to try before giving up. Default: 1m.
   --limit <count>         Loki lines per chunk. Default: 1000.
   --step <duration>       PromQL step. Default: 1m.
-  --mode <lines|count|range>
+  --mode <lines|count|agg|range>
                           logql: "lines" (default) emits every matching line as
-                          JSONL; "count" emits per-chunk counts and a total.
+                          JSONL; "count" emits per-chunk counts by pulling lines;
+                          "agg" counts SERVER-SIDE with count_over_time, which
+                          returns a number instead of lines — far cheaper, and
+                          immune to the --limit truncation entirely. Prefer "agg"
+                          whenever you only need totals.
                           promql: "range" (default) emits one merged range result.
   --out <path>            Write merged output here instead of stdout.
   --summary-json <path>   Write the per-chunk ledger as JSON (what was scanned,
@@ -276,6 +280,58 @@ def sweep_logql():
     return rows, counts
 
 
+def sweep_logql_agg():
+    """Count matches per chunk with count_over_time, evaluated once per chunk.
+
+    Counting server-side avoids pulling lines at all, so --limit truncation
+    cannot apply. The evaluation is a single instant per chunk over a range
+    exactly equal to the chunk, so windows never overlap and nothing is
+    double-counted.
+    """
+    counts = []
+    queue = []
+    lo = start
+    while lo < end:
+        queue.append((lo, min(lo + chunk, end)))
+        lo += chunk
+    queue.reverse()
+
+    while queue:
+        lo, hi = queue.pop()
+        span = hi - lo
+        rc, out, err = run_script(
+            "logql.sh",
+            ["--start", f"{hi - 1}000000000", "--end", f"{hi}000000000",
+             "--limit", "10", f"sum(count_over_time({query}[{span}s]))"],
+        )
+        if rc != 0:
+            if auth_failed(err):
+                sys.exit(err.strip() or "Grafana auth failed.")
+            if too_expensive(err) and span > min_chunk:
+                mid = lo + span // 2
+                note(f"  {stamp(lo)} .. {stamp(hi)}  502 -> splitting ({span}s)")
+                queue.append((mid, hi))
+                queue.append((lo, mid))
+                continue
+            note(f"  {stamp(lo)} .. {stamp(hi)}  FAILED")
+            ledger.append({"start": lo, "end": hi, "status": "failed", "error": err.strip()})
+            continue
+
+        payload = json.loads(out)
+        total = 0
+        for frame in payload.get("data", {}).get("result", []):
+            vals = frame.get("values") or ([frame["value"]] if "value" in frame else [])
+            if vals:
+                total += int(float(vals[-1][1]))
+        _, cached = scanned(payload)
+        counts.append((lo, hi, total))
+        ledger.append({"start": lo, "end": hi, "status": "ok",
+                       "returned": total, "cached": cached})
+        note(f"  {stamp(lo)} .. {stamp(hi)}  {total:>6} matches")
+
+    return counts
+
+
 def sweep_promql():
     series = {}
     queue = []
@@ -328,7 +384,14 @@ def sweep_promql():
 
 note(f"sweep {qtype} {stamp(start)} .. {stamp(end)}  chunk={chunk_s} mode={mode}")
 
-if qtype == "logql":
+if qtype == "logql" and mode == "agg":
+    counts = sweep_logql_agg()
+    body = "\n".join(
+        json.dumps({"start": stamp(lo), "end": stamp(hi), "count": n})
+        for lo, hi, n in counts
+    ) + "\n"
+    total = sum(n for _, _, n in counts)
+elif qtype == "logql":
     rows, counts = sweep_logql()
     rows.sort(key=lambda r: r[0])
     if mode == "count":
