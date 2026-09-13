@@ -400,9 +400,10 @@ cached = [c for c in ledger if c.get("cached")]
 note("")
 note(f"total: {total}  chunks: {len(ledger)}  failed: {len(failed)}  degraded: {len(degraded)}")
 if cached:
-    note(f"note: {len(cached)} chunk(s) were served from Loki's results cache and report 0 lines")
-    note("      scanned. A zero from a cached chunk is not a measurement — re-run those")
-    note("      windows shifted by a few seconds to force a real scan.")
+    note(f"note: {len(cached)} chunk(s) were served from Loki's results cache and under-report")
+    note("      lines scanned. The answer is still Loki's, but do not cite a scan count from")
+    note("      them — the cache is keyed by aligned splits, so shifting the window only")
+    note("      re-scans the edges. Only a range's FIRST query gives a real scan count.")
 if failed or degraded:
     note("INCOMPLETE: this sweep is a floor, not a total. Do not quote it as a count.")
     sys.exit(2)

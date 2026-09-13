@@ -68,8 +68,26 @@ Measured, same query twice over the same window:
 | Second run | **0** | 5 |
 
 `data.stats.cache.result` is the field that tells them apart — `entriesFound` or
-`queryLengthServed` above zero means the answer came from cache. To force a real
-scan, shift the window by a few seconds so the cache key changes.
+`queryLengthServed` above zero means the answer came from cache.
+
+**You cannot bust that cache from the client.** The cache is keyed by *aligned
+split intervals*, so shifting the window only re-scans the unaligned edges.
+Measured on one 1h window, cold first run 7,660 lines scanned:
+
+| Re-run | Lines scanned | Cached splits |
+| --- | --- | --- |
+| identical window | 0 | 5 |
+| shifted +37s | 0 | 5 |
+| shifted +10m | 896 | 4 |
+| shifted +1h | 2,824 | 3 |
+
+`Cache-Control: no-cache` does not help either — the datasource proxy drops it.
+
+So: **the only trustworthy scan count is the one from the first query of a
+range.** Record it when you get it; you cannot re-derive it afterwards. A cached
+answer is still the answer Loki computed for that window, so it is not
+*wrong* — but it cannot evidence what was scanned, and it will not show log lines
+that arrived after the first query.
 
 This also breaks cost estimates in the other direction: a wide window whose
 sub-windows are already cached will **succeed cheaply**, then `502` when run over
